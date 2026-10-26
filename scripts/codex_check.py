@@ -1,5 +1,9 @@
-"""Portable, privacy-preserving Codex endpoint health checker."""
+"""Portable, privacy-preserving Codex endpoint health checker.
+
+Two-step flow: (1) fingerprint identity check against a bundled 32-model
+reference library, (2) capability health check with auto-scored tasks."""
 import argparse
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
@@ -11,6 +15,8 @@ import random
 import secrets
 import sys
 from urllib.parse import urlsplit
+
+SKILL_DIR = Path(__file__).resolve().parents[1]
 
 
 def read_toml(path):
@@ -137,14 +143,20 @@ class API:
     def __init__(self, c):
         check_url(c['base'])
         self.c = c
-    def call(self, prompt, system='Answer accurately and follow the requested output format.'):
+    def call(self, prompt, system='Answer accurately and follow the requested output format.', fingerprint=False):
         import requests
         c = self.c
         if c['wire'] == 'chat':
-            body = {'model': c['model'], 'messages': [{'role':'system','content':system},{'role':'user','content':prompt}], 'max_tokens':1024}
+            body = {'model': c['model'], 'messages': [{'role':'system','content':system},{'role':'user','content':prompt}], 'max_tokens': 16 if fingerprint else 1024}
+            if fingerprint:
+                body['temperature'] = 1.0
             url = c['base'] + '/chat/completions'
         else:
-            body = {'model': c['model'], 'instructions': system, 'input': prompt, 'max_output_tokens':1024}
+            body = {'model': c['model'], 'instructions': system, 'input': prompt, 'max_output_tokens': 16 if fingerprint else 1024}
+            if c.get('reasoning_effort'):
+                body['reasoning'] = {'effort': c['reasoning_effort']}
+            if fingerprint:
+                body['temperature'] = 1.0
             url = c['base'] + '/responses'
         try:
             r = requests.post(url, json=body, headers={'Authorization':'Bearer '+c['key']}, timeout=90)
@@ -167,6 +179,62 @@ def redact(text, config):
     return text
 
 
+def identity_check(api, reps, workers):
+    """第一步: 指纹身份认证。本机采集单 token 分布, 与内置 32 模型参考库比对。
+
+    凭证不出本机; 参考库来自中转站标签, 匹配不是官方权重认证。
+    """
+    fw = SKILL_DIR / 'fingerprint_web'
+    if str(fw) not in sys.path:
+        sys.path.insert(0, str(fw))
+    import server
+    from agent_client import _normalize, REFUSAL_PAT
+    client = server.app.test_client()
+    session = client.post('/api/privacy/session/start', json={
+        'declared_model': api.c['model'], 'battery': 'orig', 'reps': reps}).get_json()
+    buckets = defaultdict(Counter)
+    errors = Counter()
+    jobs = [cell for cell in session['cells'] for _ in range(reps)]
+
+    def one(cell):
+        return cell, api.call(cell['prompt'], cell['system'], fingerprint=True)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for cell, r in pool.map(one, jobs):
+            if 'error' in r:
+                errors[r['error']] += 1
+                continue
+            raw = r['answer']
+            norm = _normalize(raw)
+            if not norm or r.get('incomplete') or REFUSAL_PAT.search(raw):
+                errors['拒答、空回答或截断'] += 1
+                continue
+            buckets[cell['cell_key']][norm] += 1
+    total_valid = sum(sum(c.values()) for c in buckets.values())
+    if len(buckets) < 10 or total_valid < len(jobs) * 0.8:
+        return {'status': 'insufficient_data', 'errors': dict(errors),
+                'note': '有效样本不足或端点不支持温度1.0短输出, 不能作身份判断。'}
+    resp = client.post('/api/privacy/session/' + session['session_id'] + '/analyze',
+                       json={'distributions': {k: dict(v) for k, v in buckets.items()}})
+    if resp.status_code != 200:
+        return {'status': 'analysis_failed', 'errors': dict(errors)}
+    data = resp.get_json()
+    quality = data.get('quality')
+    return {'status': 'completed',
+            'verdict': data['verdict'], 'verdict_zh': data['verdict_zh'],
+            'declared_in_db': data['declared_in_db'],
+            'nearest': data['nearest'], 'ranking': data['ranking'],
+            'score_declared': data['score_declared'],
+            'thresholds': data['thresholds'],
+            'quality': quality,
+            'n_cells': len(buckets), 'n_valid': total_valid,
+            'errors': dict(errors),
+            'note': '参考库为项目中转站标签采集, 未逐一官方认证; 库外≠假模型。',
+            'protocol_note': ('Responses接口与参考chat采样协议不完全一致, 匹配为探索性。'
+                              if api.c['wire'] == 'responses' else
+                              '温度1.0单token探针, 与参考库同协议。')}
+
+
 def run_health(api, seed, repeats, workers):
     ts = tasks(seed); jobs = [(t, i+1) for t in ts for i in range(repeats)]
     def one(x):
@@ -185,7 +253,7 @@ def run_health(api, seed, repeats, workers):
 
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('--codex-home'); ap.add_argument('--profile'); ap.add_argument('--model'); ap.add_argument('--base-url'); ap.add_argument('--wire-api',choices=['chat','responses']); ap.add_argument('--inspect',action='store_true'); ap.add_argument('--run',action='store_true'); ap.add_argument('--self-test',action='store_true'); ap.add_argument('--skip-identity',action='store_true',help='公开版始终不进行身份认证（兼容参数）'); ap.add_argument('--seed',type=int); ap.add_argument('--repeats',type=int,choices=[1,2,3],default=1); ap.add_argument('--workers',type=int,choices=[1,2,3,4],default=2); ap.add_argument('--output',default='model-health-results')
+    ap=argparse.ArgumentParser(); ap.add_argument('--codex-home'); ap.add_argument('--profile'); ap.add_argument('--model'); ap.add_argument('--base-url'); ap.add_argument('--wire-api',choices=['chat','responses']); ap.add_argument('--inspect',action='store_true'); ap.add_argument('--run',action='store_true'); ap.add_argument('--self-test',action='store_true'); ap.add_argument('--skip-identity',action='store_true',help='跳过第一步指纹认证, 只做能力体检'); ap.add_argument('--reps',type=int,choices=[3,4,6,8,12],default=6,help='指纹认证每单元采样次数(20单元)'); ap.add_argument('--seed',type=int); ap.add_argument('--repeats',type=int,choices=[1,2,3],default=1); ap.add_argument('--workers',type=int,choices=[1,2,3,4],default=2); ap.add_argument('--output',default='model-health-results')
     args=ap.parse_args()
     if args.self_test:
         ts=tasks(1234)
@@ -205,10 +273,47 @@ def main():
     if not args.run: raise ValueError('先用 --inspect；正式请求需添加 --run。')
     if not c['key']: raise ValueError('未找到可用 API Key；请在本机设置provider对应的环境变量。')
     if c['custom_headers_present']: raise ValueError('provider使用自定义请求头，暂不支持自动复制；停止测试以免误判。')
-    seed=args.seed if args.seed is not None else secrets.randbits(32); report=run_health(API(c),seed,args.repeats,args.workers)
-    out=Path(args.output); out.mkdir(parents=True,exist_ok=True); (out/'体检结果.json').write_text(json.dumps({'timestamp':datetime.now(timezone.utc).isoformat(),'config':safe_config(c),'health':report,'identity':{'status':'not_evaluated','authenticity_probability':None},'degradation':{'status':'not_estimable_without_baseline','percent':None}},ensure_ascii=False,indent=2),encoding='utf-8')
-    (out/'体检报告.md').write_text('# 模型能力体检\n\n- 模型声明：'+c['model']+'\n- 本次得分：'+str(report['score_percent'])+'%\n- 有效覆盖：'+str(report['coverage_percent'])+'%\n- API错误：'+str(report['api_errors'])+'\n- 随机种子：'+str(seed)+'\n\n## 各维度\n\n|维度|得分|\n|---|---|\n'+'\n'.join('|'+k+'|'+str(v['score_percent'])+'%|' for k,v in report['dimensions'].items())+'\n\n## 重要限制\n\n身份未核验。无可信基线，不判定降智百分比；请求配置不等于当前聊天路由的权重认证。24题仅为小样本诊断，不是全面能力认证。\n',encoding='utf-8')
+    api=API(c); seed=args.seed if args.seed is not None else secrets.randbits(32)
+    # 第一步: 指纹身份认证 (20 单元 x reps 次单 token 采样)
+    if args.skip_identity:
+        identity={'status':'skipped','note':'用户指定跳过指纹认证。'}
+        print('跳过指纹认证。')
+    else:
+        print(f'第一步: 指纹身份认证 (约 {20*args.reps} 个请求) ...', flush=True)
+        identity=identity_check(api,args.reps,args.workers)
+        if identity['status']=='completed':
+            print('身份判定:', identity['verdict_zh'], end='')
+            if identity.get('nearest'): print(' | 最近:', identity['nearest']['model'], identity['nearest']['dist'], end='')
+            if identity.get('quality'): print(' | 质量:', identity['quality']['verdict_zh'], end='')
+            print()
+    # 第二步: 能力体检 (24 个请求)
+    print('第二步: 能力体检 (24 个请求) ...', flush=True)
+    report=run_health(api,seed,args.repeats,args.workers)
+    out=Path(args.output); out.mkdir(parents=True,exist_ok=True)
+    (out/'体检结果.json').write_text(json.dumps({'timestamp':datetime.now(timezone.utc).isoformat(),'config':safe_config(c),'identity':identity,'health':report,'degradation':{'behavior_shift':(identity.get('quality') or {}).get('verdict'),'capability_percent':report['score_percent'],'percent':None,'note':'无可信基线,不折算降智百分比;行为偏离与能力得分分开报告。'}},ensure_ascii=False,indent=2),encoding='utf-8')
+    lines=['# 模型端点体检: 身份认证 + 能力体检','','- 模型声明：'+c['model'],'- 时间：'+datetime.now(timezone.utc).isoformat()[:19],'','## 第一步: 指纹身份认证','']
+    if identity.get('status')=='completed':
+        lines += ['- **判定：'+identity['verdict_zh']+'**']
+        if identity.get('nearest'): lines.append('- 最近参考模型：'+identity['nearest']['model']+'（'+identity['nearest']['family']+' 家族, 距离 '+str(identity['nearest']['dist'])+'）')
+        if identity.get('score_declared') is not None and identity.get('thresholds'): lines.append('- 与声明模型距离：'+str(identity['score_declared'])+'（阈值 ≤'+str(identity['thresholds']['tau_gen'])+' 一致 / ≥'+str(identity['thresholds']['tau_imp'])+' 不一致）')
+        if not identity.get('declared_in_db'): lines.append('- 声明模型不在 32 模型参考库中, 仅提供家族归因; 库外≠假模型。')
+        lines.append('- 协议：'+identity.get('protocol_note',''))
+        q=identity.get('quality')
+        lines += ['','### 行为偏离检验（探索性）','']
+        if q:
+            lines += ['- '+('✅ '+q['verdict_zh'] if q['verdict']=='nominal' else '⚠️ '+q['verdict_zh'])+'（p='+str(q['p_value'])+', 效应量 '+str(q['effect'])+'×）']
+            if q.get('deviating_cells'): lines.append('- 偏离最大单元：'+', '.join(c['cell']+' '+str(c['jsd_obs']) for c in q['deviating_cells'][:3]))
+            lines.append('- 偏离≠能力下降证明; 是与该版本参考行为的差异信号。')
+        else:
+            lines.append('- 未执行（身份不一致/灰区或数据不足时无意义）。')
+    else:
+        lines += ['- 状态：'+identity.get('status','未执行')+' — '+identity.get('note','')]
+    lines += ['','## 第二步: 能力体检','','- 本次得分：'+str(report['score_percent'])+'%','- 有效覆盖：'+str(report['coverage_percent'])+'%','- API错误：'+str(report['api_errors'])+'','- 随机种子：'+str(seed),'','|维度|得分|','|---|---|']
+    lines += ['|'+k+'|'+str(v['score_percent'])+'%|' for k,v in report['dimensions'].items()]
+    lines += ['','## 重要限制','','- 参考库来自中转站标签, 匹配不是官方权重认证。','- 行为偏离与能力得分分开报告; 无可信基线, 不折算降智百分比。','- 配置端点不等于当前聊天路由的权重实例。','- 24题+20单元指纹为小样本诊断, 不是全面认证。']
+    (out/'体检报告.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
     print('报告已生成:',out)
+    print('身份:',identity.get('verdict_zh',identity.get('status')),'| 能力得分:',report['score_percent'],'| 降智百分比: 无基线不可估计')
 
 if __name__=='__main__':
     try: main()

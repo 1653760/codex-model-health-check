@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -66,6 +67,46 @@ class Tests(unittest.TestCase):
     def test_redaction(self):
         self.assertNotIn('secret',check.redact('secret',{'key':'secret'}))
         with self.assertRaises(ValueError):check.check_url('https://user:pass@example.com')
+
+    def test_identity_two_step_offline(self):
+        """用参考库自身数据模拟端点: 真qwen-plus应判一致, 假gpt-5.5应判不一致。"""
+        import time
+        t0=time.time()
+        class FakeAPI:
+            def __init__(self,declared,answers):
+                self.c={'model':declared,'wire':'chat','key':'x','base':'https://example.com/v1'}
+                self._answers=answers; self._i=0
+            def call(self,prompt,system='x',fingerprint=False):
+                seq=self._answers.get(prompt) or ['7']
+                self._i+=1
+                return {'answer':seq[self._i%len(seq)]}
+        fw=Path(__file__).resolve().parents[1]/'fingerprint_web'
+        sys.path.insert(0,str(fw))
+        import server
+        battery=server.DB.batteries['orig']
+        plus={};turbo={}
+        for cell in battery:
+            task,lang=cell
+            prompt=None
+            if lang in ('en','zh') and task in server.ALL_PROMPTS.get(lang,{}):
+                prompt=server.ALL_PROMPTS[lang][task]
+            if not prompt:continue
+            ref_p=server.DB.cells.get(('qwen-plus',)+cell,[])
+            ref_t=server.DB.cells.get(('qwen-turbo',)+cell,[])
+            if len(ref_p)>=8:plus[prompt]=ref_p
+            if len(ref_t)>=8:turbo[prompt]=ref_t
+        self.assertGreaterEqual(len(plus),15)
+        honest=check.identity_check(FakeAPI('qwen-plus',plus),3,2)
+        self.assertEqual(honest['status'],'completed')
+        self.assertEqual(honest['verdict'],'consistent')
+        self.assertEqual(honest['nearest']['model'],'qwen-plus')
+        self.assertIsNotNone(honest.get('quality'))
+        swapped=check.identity_check(FakeAPI('gpt-5.5',plus),3,2)
+        self.assertEqual(swapped['verdict'],'inconsistent')
+        self.assertEqual(swapped['nearest']['model'],'qwen-plus')
+        outside=check.identity_check(FakeAPI('no-such-model-xyz',plus),3,2)
+        self.assertIn(outside['verdict'],('not_in_db','inconsistent'))
+        self.assertLess(time.time()-t0,300)
 
 
 if __name__=='__main__':unittest.main()
